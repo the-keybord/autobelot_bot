@@ -20,13 +20,20 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
                     level=logging.INFO)
 
 logger = logging.getLogger(__name__)
-myclient = pymongo.MongoClient(cfg.dbhost)
-mydb = myclient[cfg.db]
-mycol = mydb["users"]
+
+pymongo_client = pymongo.MongoClient(cfg.dbhost)
+pymongo_db = pymongo_client[cfg.db]
+usercoll = pymongo_db["user"]
+
 GAME, PLAYER, COZ = range(3)
+
 score_regex='^(?:-?[0-9]{1,2}|bt)\s+(?:-?[0-9]{1,2}|bt)$'
 
-def get_scorelist(coll, user_id):
+
+def retrieve_scorelist(coll, user_id):
+    """Return a list of dict containing date of game start, and score
+    Only use to display the scoreboard to user.
+    """
     return list(coll.aggregate([
         {"$match": {"username":user_id}},
         {"$unwind":"$game4.round"},
@@ -40,7 +47,10 @@ def get_scorelist(coll, user_id):
                                     }},
     ]))
 
-def get_sum(coll, user_id):
+def retrieve_sum(coll, user_id):
+    """Return a dict with sums of scores and bolts.
+    Values are 0 if array is empty.
+    """
     return coll.aggregate([
         {"$match":{"username":user_id}},
         {"$project": {"game4.round": {'$cond':[{"$ne":[{"$size":"$game4.round"},0]},
@@ -55,7 +65,8 @@ def get_sum(coll, user_id):
                                 "bolt_them":{"$sum":"$game4.round.bolt_them"}}}
     ]).next()
 
-def get_last_score(coll, user_id):
+def retrieve_last_score(coll, user_id):
+    """Return a dict with last inserted score."""
     return coll.aggregate([
         {"$match": {"username":user_id}},
         {"$project": {"game4.round": {'$cond':[{"$ne":[{"$size":"$game4.round"},0]},
@@ -76,9 +87,12 @@ def is_int(s):
         return False
 
 def start(update, context):
-    test = mycol.find_one({"username":update.message.from_user.id,"game4.round":{"$exists":"true"}})
+    """Callback function for /start command, 
+    Initialize a new game,
+    If game already exists, display information and continue the existing game
+    """
+    test = usercoll.find_one({"username":update.message.from_user.id,"game4.round":{"$exists":"true"}})
     if test is not None:
-        #regex_score_message(update,context)
         update.message.reply_text("This is your current score:")
         reply_scoreboard(update, context)
         update.message.reply_text("Continue or, use /new to reset score")
@@ -87,8 +101,11 @@ def start(update, context):
         return new_game(update, context)
 
 def new_game(update, context):
-    mycol.delete_many({"username":update.message.from_user.id})
-    mycol.update_one({'username':update.message.from_user.id},
+    """Callback function for /new command
+    Delete all data about user, initialize a new game with current date
+    """
+    usercoll.delete_many({"username":update.message.from_user.id})
+    usercoll.update_one({'username':update.message.from_user.id},
                     {'$set':{'game4.date':str(datetime.date.today()),'game4.round':[]}},
         upsert=True)
     update.message.reply_text("*NEW GAME*\n"
@@ -102,10 +119,11 @@ def cancel(update, context):
     return ConversationHandler.END
 
 def score_undo_callback(update, context):
-    test = mycol.find_one({'username':update.message.from_user.id,'game4.round':{'$size':1}})
+    """Remove the last entered score, init a new game if user removed every score"""
+    test = usercoll.find_one({'username':update.message.from_user.id,'game4.round':{'$size':1}})
     if test is None:
         update.message.reply_text("Last round has been removed")
-        mycol.update_one({'username':update.message.from_user.id},{'$pop': {'game4.round':1}})
+        usercoll.update_one({'username':update.message.from_user.id},{'$pop': {'game4.round':1}})
         reply_sum(update, context)
         return GAME
     else:
@@ -113,10 +131,11 @@ def score_undo_callback(update, context):
         return new_game(update, context)
 
 def score_regex_callback(update, context):
+    """Callback function for score entered by user based on regex"""
     user_id = update.message.from_user.id
     score_string = update.message.text
     score_split = score_string.split()
-    presult = get_sum(mycol,user_id)
+    presult = retrieve_sum(usercoll,user_id)
     if is_int(score_split[0]):
         score_us = int(score_split[0])
         bolt_us = 0
@@ -143,7 +162,7 @@ def score_regex_callback(update, context):
         else:
             bolt_them = 1
 
-    mycol.update_one({'username':user_id},{'$push':{'game4.round':
+    usercoll.update_one({'username':user_id},{'$push':{'game4.round':
                     {'score_us':score_us,'bolt_us':bolt_us,
                     'score_them':score_them,'bolt_them':bolt_them}}})
     reply_sum(update, context)
@@ -151,9 +170,10 @@ def score_regex_callback(update, context):
     return GAME
 
 def reply_win(update, context):
+    """Message user about potential game winner (depending on their game rules)"""
     levels = [151,101,51]
-    sum_ = get_sum(mycol,update.message.from_user.id)
-    last_score = get_last_score(mycol,update.message.from_user.id)
+    sum_ = retrieve_sum(usercoll,update.message.from_user.id)
+    last_score = retrieve_last_score(usercoll,update.message.from_user.id)
     if sum_['sum_us']>sum_['sum_them']:
         current = sum_['sum_us']
         secondary = sum_['sum_them']
@@ -171,27 +191,26 @@ def reply_win(update, context):
             break
 
 def reply_sum(update, context):
-    sum_ = get_sum(mycol,update.message.from_user.id)
-    #sum_us = sum_['sum_us']
-    #sum_them = sum_['sum_them']
-    #last_us = last_score['score_us']
-    #last_them = last_score['score_them']
+    """Message user the score of current game"""
+    sum_ = retrieve_sum(usercoll,update.message.from_user.id)
     update.message.reply_text("Current score: "+str(sum_['sum_us'])+" "+str(sum_['sum_them']))
-    #update.message.reply_text("Last sum: "+str(last_score['score_us'])+" "+str(last_score['score_them']))
     
 def reply_scoreboard(update, context):
+    """Message user the scoreboard and additional information about game
+    Callback function for /scoreboard command
+    """
     user_id = update.message.from_user.id
     score_table = PrettyTable()
     score_table.field_names = ["us","them"]
     score_table.align["us"] = 'r'
     score_table.align["them"] = 'l'
     score_date = ""
-    scorelist = get_scorelist(mycol,user_id)
+    scorelist = retrieve_scorelist(usercoll,user_id)
     for x in scorelist:
         score_table.add_row([x["us"],x["them"]])
         score_date = x["date"]
     score_table.add_row(["====","===="])
-    sum_ = get_sum(mycol,user_id)
+    sum_ = retrieve_sum(usercoll,user_id)
     score_table.add_row([sum_["sum_us"],sum_["sum_them"]])
 
     update.message.reply_text(score_date+f'<pre>{score_table}</pre>', parse_mode=ParseMode.HTML)
@@ -218,12 +237,11 @@ def main():
     updater = Updater(cfg.token, use_context=True)
     dp = updater.dispatcher
     
-    """Handlers"""
+    # Handlers declaration 
     score_invalid_handler = MessageHandler(Filters.text, score_invalid)
     score_regex_handler = MessageHandler(Filters.regex(score_regex),score_regex_callback)
-    # log all errors
-    dp.add_error_handler(error)
-
+    
+    # The main usage scenarios of the bot are specified in this handler
     conv_handler = ConversationHandler(
         entry_points= [CommandHandler(["start","continue"], start),
                         CommandHandler("new", new_game)],
@@ -238,11 +256,10 @@ def main():
         allow_reentry=True
     )
     dp.add_handler(conv_handler)
-    # Start the Bot
+    dp.add_error_handler(error)
+
     updater.start_polling()
-    # Run the bot until you press Ctrl-C or the process receives SIGINT,
-    # SIGTERM or SIGABRT. This should be used most of the time, since
-    # start_polling() is non-blocking and will stop the bot gracefully.
+
     updater.idle()
 
 
